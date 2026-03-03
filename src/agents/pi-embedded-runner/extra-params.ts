@@ -219,10 +219,17 @@ function createGoogleThinkingPayloadWrapper(
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
+    // Only intercept payloads for Google-compatible API types; pass through
+    // directly for all other providers to avoid unnecessary options-object
+    // wrapping that can interfere with provider-specific streamFn chains
+    // (e.g. google-vertex crash — see openclaw/openclaw#33392).
+    if (model.api !== "google-generative-ai" && model.api !== "google-vertex") {
+      return underlying(model, context, options);
+    }
     const onPayload = options?.onPayload;
     return underlying(model, context, {
       ...options,
-      onPayload: (payload) => {
+      onPayload: (payload, payloadModel) => {
         if (model.api === "google-generative-ai") {
           sanitizeGoogleThinkingPayload({
             payload,
@@ -230,7 +237,7 @@ function createGoogleThinkingPayloadWrapper(
             thinkingLevel,
           });
         }
-        return onPayload?.(payload, model);
+        return onPayload?.(payload, payloadModel);
       },
     });
   };
