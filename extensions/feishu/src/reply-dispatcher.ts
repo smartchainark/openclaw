@@ -284,6 +284,59 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
           }
 
+          // Flush any accumulated plain-block text before the final message so
+          // ordering is preserved (plain blocks appear before the final card/text)
+          // and the flush is properly awaited within the delivery path (#34197).
+          if (info?.kind === "final" && pendingBlockText.trim()) {
+            const flushText = pendingBlockText;
+            pendingBlockText = "";
+            try {
+              const useCardForFlush =
+                renderMode === "card" || (renderMode === "auto" && shouldUseCard(flushText));
+              let firstFlush = true;
+              if (useCardForFlush) {
+                for (const chunk of core.channel.text.chunkTextWithMode(
+                  flushText,
+                  textChunkLimit,
+                  chunkMode,
+                )) {
+                  await sendMarkdownCardFeishu({
+                    cfg,
+                    to: chatId,
+                    text: chunk,
+                    replyToMessageId: sendReplyToMessageId,
+                    replyInThread: effectiveReplyInThread,
+                    mentions: firstFlush ? mentionTargets : undefined,
+                    accountId,
+                  });
+                  firstFlush = false;
+                }
+              } else {
+                const converted = core.channel.text.convertMarkdownTables(flushText, tableMode);
+                for (const chunk of core.channel.text.chunkTextWithMode(
+                  converted,
+                  textChunkLimit,
+                  chunkMode,
+                )) {
+                  await sendMessageFeishu({
+                    cfg,
+                    to: chatId,
+                    text: chunk,
+                    replyToMessageId: sendReplyToMessageId,
+                    replyInThread: effectiveReplyInThread,
+                    mentions: firstFlush ? mentionTargets : undefined,
+                    accountId,
+                  });
+                  firstFlush = false;
+                }
+              }
+            } catch (err) {
+              params.runtime.error?.(
+                `feishu[${account.accountId}] block-text flush failed: ${String(err)}`,
+              );
+            }
+          }
+
           if (info?.kind === "final" && streamingEnabled && useCard) {
             startStreaming();
             if (streamingStartPromise) {
@@ -373,17 +426,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         params.runtime.error?.(
           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
         );
+        // Discard buffered block text so onIdle does not send stale content
+        // after a block-pipeline abort or timeout (#34197).
+        pendingBlockText = "";
         await closeStreaming();
         typingCallbacks.onIdle?.();
       },
       onIdle: async () => {
-        await closeStreaming();
         // Flush accumulated plain-text blocks that were not handled by a
         // streaming card.  Without this, blockStreamingDefault="on" silently
         // drops replies when the text doesn't qualify for card rendering (#34093).
+        // Flush before closeStreaming so plain-text blocks appear before the
+        // streaming card is finalized, preserving message order (#34197).
         // Note: onIdle is invoked fire-and-forget by the core dispatcher, so we
         // wrap the flush in try/catch to surface errors and prevent unhandled
         // rejections (#34093 review feedback).
+        // In most cases pendingBlockText is already cleared by deliver(final) or
+        // onError; this acts as a safety net for the no-final-payload case.
         if (pendingBlockText.trim()) {
           const flushText = pendingBlockText;
           pendingBlockText = "";
@@ -433,6 +492,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             );
           }
         }
+        await closeStreaming();
         typingCallbacks.onIdle?.();
       },
       onCleanup: () => {
