@@ -279,7 +279,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             } else {
               // Cannot stream this block (plain text or streaming disabled).
               // Accumulate so onIdle can flush a single message (#34093).
-              pendingBlockText += (pendingBlockText ? "\n" : "") + text;
+              // Concatenate without injecting newlines; block replies are
+              // emitted as contiguous streams without inter-chunk line breaks.
+              pendingBlockText += text;
               return;
             }
           }
@@ -433,11 +435,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         typingCallbacks.onIdle?.();
       },
       onIdle: async () => {
+        // Close the streaming card first so card-first mixed turns preserve
+        // emission order (card → trailing plain text) (#34197).
+        await closeStreaming();
         // Flush accumulated plain-text blocks that were not handled by a
         // streaming card.  Without this, blockStreamingDefault="on" silently
         // drops replies when the text doesn't qualify for card rendering (#34093).
-        // Flush before closeStreaming so plain-text blocks appear before the
-        // streaming card is finalized, preserving message order (#34197).
         // Note: onIdle is invoked fire-and-forget by the core dispatcher, so we
         // wrap the flush in try/catch to surface errors and prevent unhandled
         // rejections (#34093 review feedback).
@@ -492,7 +495,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             );
           }
         }
-        await closeStreaming();
         typingCallbacks.onIdle?.();
       },
       onCleanup: () => {
